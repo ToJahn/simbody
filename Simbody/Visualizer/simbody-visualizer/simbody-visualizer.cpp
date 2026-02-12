@@ -27,6 +27,9 @@
 #include "../src/VisualizerProtocol.h"
 #include "lodepng.h"
 
+#include <deque>
+#include <mutex>
+#include <filesystem>
 #include <cstdlib>
 #include <cmath>
 #include <string>
@@ -95,6 +98,21 @@ static void redrawDisplay();
 static void setKeepAlive(bool enable);
 static void setVsync(bool enable);
 static void shutdown();
+
+static bool dumpEveryFrame = false;
+static bool autoExitWhenSimulatorStops = false;
+static std::string dumpEveryFrameDir;
+static int dumpEveryFrameCounter = 0;
+static std::mutex dumpMutex;
+static std::deque<int> dumpQueue;
+static int dumpFrameIndex = 0;  // no longer atomic needed if guarded
+static int expectedDumpFrames = -1;  // -1 = disabled
+static int dumpedFramesCount = 0;
+static bool autoExitOnIdle = false;
+static double idleTimeoutSec = 1.0;  // default
+static double lastSceneArrivedWallTime = 0.0;
+
+
 
 // Next, get the functions necessary for reading from and writing to pipes.
 #ifdef _WIN32
@@ -1679,11 +1697,41 @@ static void redrawDisplay() {
 
     glMatrixMode(GL_PROJECTION);
     glPopMatrix();
+
+    int frameToWrite = -1;
+    if (dumpEveryFrame) {
+        std::lock_guard<std::mutex> lk(dumpMutex);
+        if (!dumpQueue.empty()) {
+            frameToWrite = dumpQueue.front();
+            dumpQueue.pop_front();
+        }
+    }
+
+    if (frameToWrite != -1) {
+        std::stringstream filename;
+        filename << dumpEveryFrameDir << "/Frame" << std::setw(6)
+                 << std::setfill('0') << frameToWrite << ".png";
+
+        glFinish();  // optional but reduces “blank/partial” risk
+        writeImage(filename.str());
+    }
+
     glutSwapBuffers();
     ++fpsCounter;
     ++frameCounter;
 
     lastRedisplayDone = realTime();
+    if (autoExitOnIdle && dumpEveryFrame) {
+        bool queueEmpty = false;
+        {
+            std::lock_guard<std::mutex> lk(dumpMutex);
+            queueEmpty = dumpQueue.empty();
+        }
+        const double now = realTime();
+        if (queueEmpty && (now - lastSceneArrivedWallTime) > idleTimeoutSec) {
+            shutdown();  // exits the visualizer
+        }
+    }
 }
 
 // These are set when a mouse button is clicked and then referenced
@@ -2474,6 +2522,11 @@ void listenForInput() {
             }
             // Swap in the new scene.
             scene = newScene;
+            if (dumpEveryFrame) {
+                std::lock_guard<std::mutex> lk(dumpMutex);
+                dumpQueue.push_back(++dumpFrameIndex);
+                lastSceneArrivedWallTime = realTime();
+            }
             saveNextFrameToMovie = savingMovie;
             lock.unlock();                                 //-- UNLOCK SCENE ---
             forceActiveRedisplay();               //------- ACTIVE REDISPLAY ---
@@ -2520,9 +2573,14 @@ void listenForInput() {
         if (!issuedActiveRedisplay)
             requestPassiveRedisplay();         //------- PASSIVE REDISPLAY --
     }
-  } catch (const ReadingInterrupted&) {
+    } catch (const ReadingInterrupted&) {
         // Stop listening, because the simulator was closed.
-  } catch (const std::exception& e) {
+        if (autoExitWhenSimulatorStops) {
+            // Tell GLUT loop to exit cleanly.
+            shutdown();
+
+        }
+    } catch (const std::exception& e) {
         std::cout << "simbody-visualizer listenerThread: unrecoverable error:\n";
         std::cout << e.what() << std::endl;
     }
@@ -2776,32 +2834,78 @@ static void shutdown() {
 }
 
 int main(int argc, char** argv) {
-  try
-  { bool talkingToSimulator = false;
-      
-    if (argc >= 3) {
-        stringstream(argv[1]) >> inPipe;
-        stringstream(argv[2]) >> outPipe;
-        talkingToSimulator = true; // presumably those were the pipes
-  } else {
-        printf("\n**** VISUALIZER HAS NO SIMULATOR TO TALK TO ****\n");
-        printf("The simbody-visualizer was invoked directly with no simulator\n");
-        printf("process to talk to. Will attempt to bring up the display anyway\n");
-        printf("in case you want to look at the About message.\n");
-        printf("The simbody-visualizer is intended to be invoked programmatically.\n");
-    }
+    try {
+        std::vector<std::string> positional;
+        positional.reserve(argc);
+        positional.push_back(argv[0]);
+
+        for (int i = 1; i < argc; ++i) {
+            std::string arg = argv[i];
+
+            if (arg == "--dumpFrames" && i + 1 < argc) {
+                dumpEveryFrame = true;
+                dumpEveryFrameDir = argv[++i];
+                std::filesystem::create_directories(dumpEveryFrameDir);
+                continue;
+            }
+
+            positional.push_back(arg);
+        }
+
+        // Env var fallback (CLI takes precedence)
+        if (!dumpEveryFrame) {
+            const char* env = std::getenv("SIMBODY_DUMP_FRAMES");
+            if (env && *env) {
+                dumpEveryFrame = true;
+                dumpEveryFrameDir = env;
+                std::filesystem::create_directories(dumpEveryFrameDir);
+            }
+        }
+
+        if (const char* e = std::getenv("SIMBODY_AUTO_EXIT_IDLE_SEC")) {
+            autoExitOnIdle = true;
+            idleTimeoutSec = std::atof(e);
+            if (idleTimeoutSec <= 0) idleTimeoutSec = 1.0;
+        }
+        lastSceneArrivedWallTime = realTime();
 
 
-    // Initialize GLUT, then perform initial handshake with the parent
-    // from the main thread here.
-    glutInit(&argc, argv);
+        // Filtered argv for GLUT
+        std::vector<char*> glutArgv;
+        glutArgv.reserve(positional.size());
+        for (auto& s : positional) glutArgv.push_back(s.data());
+        int glutArgc = (int)glutArgv.size();
 
-    if (talkingToSimulator)
-        shakeHandsWithSimulator(inPipe, outPipe);
-    else {
-        simbodyVersionStr = "?.?.?";
-        simulatorExecutableName = "No simulator";
-    }
+        bool talkingToSimulator = false;
+
+        if (positional.size() == 3) {
+            stringstream(positional[1]) >> inPipe;
+            stringstream(positional[2]) >> outPipe;
+            talkingToSimulator = true;
+        } else {
+            printf("\n**** VISUALIZER HAS NO SIMULATOR TO TALK TO ****\n");
+            printf(
+                "The simbody-visualizer was invoked directly with no "
+                "simulator\n");
+            printf(
+                "process to talk to. Will attempt to bring up the display "
+                "anyway\n");
+            printf("in case you want to look at the About message.\n");
+            printf(
+                "The simbody-visualizer is intended to be invoked "
+                "programmatically.\n");
+        }
+
+        // IMPORTANT: use filtered args here
+        glutInit(&glutArgc, glutArgv.data());
+
+        if (talkingToSimulator)
+            shakeHandsWithSimulator(inPipe, outPipe);
+        else {
+            simbodyVersionStr = "?.?.?";
+            simulatorExecutableName = "No simulator";
+        }
+    
 
     // Construct the default initial title.
     string title = "Simbody " + simbodyVersionStr + ": " + simulatorExecutableName;
@@ -2845,7 +2949,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    setVsync(true);
+    setVsync(!dumpEveryFrame);
 
     // Set up lighting.
 
